@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hudson MA · Exempt Debt Projection</title>
+<style>
+  body { margin: 0; padding: 0; background: #F4F1EA; }
+  #root { min-height: 100vh; }
+</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo } = React;
+const { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, BarChart, Bar, LineChart, Line } = Recharts;
+
+
+// ============================================================
+// Hudson MA Exempt Debt Projection
+// Source data: Treasurer's Total General Fund Exempt Debt schedule (Bal at 6/30/2026)
+// FY26 Tax Classification Hearing (Dec 1, 2025): avg single-family $609,924
+// ============================================================
+
+const HOME_VALUE_DEFAULT = 609924;
+const TOTAL_AV = 4_613_608_067;
+const RES_SHARE = 0.88; // residential share of total AV
+const FY26_TOTAL_LEVY = 73_782_703; // from FY26 classification hearing
+const FY26_DEBT_EXCLUSION = 4_070_474;
+const FY26_AVG_TAX_BILL = 9753; // $609,924 * $15.99/1000 (single-rate equivalent)
+// Historical context: avg home grew 5.97% CAGR FY13-FY26; recent FY25-FY26 was 3.99%
+
+// Hudson's 9 existing exempt debt items
+// rates: explicit where shown in schedule, estimated where not (DPW HQ tranches assumed 3%)
+const DEBTS = [
+  { id: 'senior',    name: 'Senior Center Renovation',   issued: '10-09', balance: 929888.75,    lastYear: 2028, rate: 0.0366, color: '#8B7355', category: 'Other' },
+  { id: 'jfk1',      name: 'JFK School Construction',    issued: '06-11', balance: 6821375.00,   lastYear: 2032, rate: 0.0373, color: '#A8334D', category: 'Schools' },
+  { id: 'jfk2',      name: 'JFK School Construction',    issued: '12-14', balance: 456625.00,    lastYear: 2034, rate: 0.0275, color: '#C45A6E', category: 'Schools' },
+  { id: 'pwphq1',    name: 'Public Works/Police HQ',     issued: '12-14', balance: 976500.00,    lastYear: 2034, rate: 0.0282, color: '#3F5E39', category: 'DPW/Police' },
+  { id: 'dpwphq1',   name: 'DPW/Police HQ',              issued: '06-16', balance: 5470812.50,   lastYear: 2036, rate: 0.0300, color: '#5A7D54', category: 'DPW/Police' },
+  { id: 'dpwphq2',   name: 'DPW/Police HQ',              issued: '06-17', balance: 1590550.00,   lastYear: 2037, rate: 0.0300, color: '#7A9D74', category: 'DPW/Police' },
+  { id: 'jfk3',      name: 'JFK School Construction',    issued: '06-17', balance: 515875.00,    lastYear: 2037, rate: 0.0300, color: '#D88195', category: 'Schools' },
+  { id: 'assabet',   name: 'Assabet School Renovation',  issued: '05-12', balance: 1655000.00,   lastYear: 2041, rate: 0.0300, color: '#7A2A3F', category: 'Schools' },
+  { id: 'newdpw',    name: 'New DPW Facility (temp note)', issued: '5/23', balance: 34000000.00, lastYear: 2055, rate: 0.0500, color: '#2D4A29', category: 'DPW/Police' },
+];
+
+// Calculate level-debt-service annual payment
+function levelPayment(pv, rate, years) {
+  if (rate === 0) return pv / years;
+  return pv * rate / (1 - Math.pow(1 + rate, -years));
+}
+
+// Build amortization schedule for a debt
+function buildSchedule(debt, startYear = 2027) {
+  const years = debt.lastYear - 2026;
+  const pmt = levelPayment(debt.balance, debt.rate, years);
+  const schedule = [];
+  let remaining = debt.balance;
+  for (let i = 0; i < years; i++) {
+    const interest = remaining * debt.rate;
+    const principal = pmt - interest;
+    remaining = Math.max(0, remaining - principal);
+    schedule.push({
+      year: startYear + i,
+      payment: pmt,
+      interest,
+      principal,
+      balance: remaining,
+    });
+  }
+  return { ...debt, annualPayment: pmt, schedule };
+}
+
+const formatCurrency = (val) => {
+  if (val >= 1000000) return `$${(val / 1000000).toFixed(1)}M`;
+  if (val >= 1000) return `$${(val / 1000).toFixed(0)}K`;
+  return `$${val.toFixed(0)}`;
+};
+
+const formatDollar = (val) => `$${Math.round(val).toLocaleString()}`;
+
+function HudsonDebtDashboard() {
+  const [homeValue, setHomeValue] = useState(HOME_VALUE_DEFAULT);
+  const [roofCost, setRoofCost] = useState(7255000);
+  const [roofTerm, setRoofTerm] = useState(15);
+  const [roofRate, setRoofRate] = useState(5.82); // %
+  const [includeRoof, setIncludeRoof] = useState(true);
+  const [view, setView] = useState('stacked'); // stacked | byProject | perHome | totalBill | ratio
+  const [valueGrowth, setValueGrowth] = useState(3.0); // % annual property value appreciation
+  const [levyGrowth, setLevyGrowth] = useState(2.5); // % Prop 2.5 limit
+  const [includeLibrary, setIncludeLibrary] = useState(false);
+  const [libraryTotal, setLibraryTotal] = useState(22_000_000); // midpoint of $20-24M range
+  const [libraryStartYear, setLibraryStartYear] = useState(2029);
+  const [libraryTerm, setLibraryTerm] = useState(25);
+  const [libraryRate, setLibraryRate] = useState(5.0); // %
+  const [sortKey, setSortKey] = useState('lastYear');
+  const [sortDir, setSortDir] = useState('asc'); // asc | desc
+  // Rate of 5.82% calibrated to match Town's stated $97.59/yr per avg home
+  // (Tax Impact slide, debt exclusion hearing Dec 2025)
+  
+  // Convert percentage inputs to decimals for math
+  const roofRateDec = roofRate / 100;
+  const libraryRateDec = libraryRate / 100;
+  const valueGrowthDec = valueGrowth / 100;
+  const levyGrowthDec = levyGrowth / 100;
+  // Rate of 5.82% calibrated to match Town's stated $97.59/yr per avg home
+  // (Tax Impact slide, debt exclusion hearing Dec 2025)
+  
+  // MBLC grant tiered formula: 60% / 45% / 35% / 30% on tranches
+  const calcMBLCGrant = (total) => {
+    let grant = 0;
+    grant += Math.min(total, 5_000_000) * 0.60;
+    grant += Math.max(0, Math.min(total - 5_000_000, 5_000_000)) * 0.45;
+    grant += Math.max(0, Math.min(total - 10_000_000, 10_000_000)) * 0.35;
+    grant += Math.max(0, Math.min(total - 20_000_000, 30_000_000)) * 0.30;
+    return grant;
+  };
+  const libraryGrant = calcMBLCGrant(libraryTotal);
+  const libraryLocal = libraryTotal - libraryGrant;
+
+  // Build all schedules
+  const debtSchedules = useMemo(() => DEBTS.map(d => buildSchedule(d)), []);
+
+  // Build school roof schedule (assume issuance in FY27, payments start FY28)
+  const roofSchedule = useMemo(() => {
+    const debt = {
+      id: 'roof',
+      name: 'High School + Farley Roofs',
+      issued: 'Proposed',
+      balance: roofCost,
+      lastYear: 2027 + roofTerm,
+      rate: roofRateDec,
+      color: '#D4A574',
+      category: 'Schools',
+    };
+    return buildSchedule(debt, 2028);
+  }, [roofCost, roofTerm, roofRateDec]);
+
+  // Build library schedule (only the local share is bonded; MBLC pays its grant directly)
+  const librarySchedule = useMemo(() => {
+    const debt = {
+      id: 'library',
+      name: `Library Project (local share, post-MBLC)`,
+      issued: 'Proposed',
+      balance: libraryLocal,
+      lastYear: libraryStartYear + libraryTerm - 1,
+      rate: libraryRateDec,
+      color: '#4A6B8A',
+      category: 'Library',
+    };
+    return buildSchedule(debt, libraryStartYear);
+  }, [libraryLocal, libraryStartYear, libraryTerm, libraryRateDec]);
+
+  // All schedules combined
+  const allSchedules = useMemo(() => {
+    let s = [...debtSchedules];
+    if (includeRoof) s.push(roofSchedule);
+    if (includeLibrary) s.push(librarySchedule);
+    return s;
+  }, [debtSchedules, roofSchedule, librarySchedule, includeRoof, includeLibrary]);
+
+  // Year range
+  const minYear = 2027;
+  const maxYear = Math.max(...allSchedules.map(d => d.lastYear));
+
+  // Build year-by-year payment data for stacked chart
+  const yearlyData = useMemo(() => {
+    const years = [];
+    for (let y = minYear; y <= maxYear; y++) {
+      const row = { year: y, total: 0 };
+      allSchedules.forEach(d => {
+        const yearEntry = d.schedule.find(s => s.year === y);
+        const payment = yearEntry ? yearEntry.payment : 0;
+        row[d.id] = payment;
+        row.total += payment;
+      });
+      
+      // Years since FY27 baseline
+      const yearsForward = y - 2027;
+      
+      // Projected home value (grows with appreciation)
+      const projectedHomeValue = homeValue * Math.pow(1 + valueGrowthDec, yearsForward);
+      const projectedTotalAV = TOTAL_AV * Math.pow(1 + valueGrowthDec, yearsForward);
+      const projectedResAV = projectedTotalAV * RES_SHARE;
+      
+      // Per-home debt burden (debt is fixed dollars, AV grows -> share shrinks)
+      const resTotal = row.total * RES_SHARE;
+      row.perHome = (projectedHomeValue / projectedResAV) * resTotal;
+      // Equivalent: row.perHome = (homeValue/totalResAV) * resTotal -- AV growth cancels
+      // But we keep separated for clarity and to allow uneven growth scenarios
+      
+      // Projected total tax bill (grows with Prop 2.5 + new growth, ~levyGrowth assumption)
+      // Levy grows by levyGrowth (2.5% Prop 2.5) per year, plus debt exclusions on top
+      const baseLevyGrowth = (FY26_TOTAL_LEVY - FY26_DEBT_EXCLUSION) * Math.pow(1 + levyGrowthDec, yearsForward + 1);
+      const projectedTotalLevy = baseLevyGrowth + row.total;
+      
+      // Avg home's share of total levy
+      const projectedTaxBill = (projectedHomeValue / projectedTotalAV) * projectedTotalLevy;
+      row.totalTaxBill = projectedTaxBill;
+      row.nonDebtTaxBill = projectedTaxBill - row.perHome;
+      row.debtRatio = row.perHome / projectedTaxBill;
+      row.projectedHomeValue = projectedHomeValue;
+      
+      years.push(row);
+    }
+    return years;
+  }, [allSchedules, homeValue, maxYear, valueGrowthDec, levyGrowthDec]);
+
+  // Lifetime totals (P+I) per debt
+  const debtTotals = useMemo(() => {
+    return allSchedules.map(d => {
+      const totalPaid = d.schedule.reduce((sum, s) => sum + s.payment, 0);
+      const totalInterest = d.schedule.reduce((sum, s) => sum + s.interest, 0);
+      const perHomeLifetime = (homeValue / (TOTAL_AV * RES_SHARE)) * totalPaid * RES_SHARE;
+      const perHomeAnnual = (homeValue / (TOTAL_AV * RES_SHARE)) * d.annualPayment * RES_SHARE;
+      return {
+        ...d,
+        totalPaid,
+        totalInterest,
+        perHomeLifetime,
+        perHomeAnnual,
+      };
+    });
+  }, [allSchedules, homeValue]);
+
+  // Sorted view for the table
+  const sortedDebts = useMemo(() => {
+    const arr = [...debtTotals];
+    const dir = sortDir === 'asc' ? 1 : -1;
+    arr.sort((a, b) => {
+      const av = a[sortKey];
+      const bv = b[sortKey];
+      if (typeof av === 'string') return av.localeCompare(bv) * dir;
+      return (av - bv) * dir;
+    });
+    return arr;
+  }, [debtTotals, sortKey, sortDir]);
+
+  const handleSort = (key) => {
+    if (sortKey === key) {
+      setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortKey(key);
+      // Default to descending for numeric columns (most useful), ascending for text/year
+      setSortDir(['name', 'lastYear'].includes(key) ? 'asc' : 'desc');
+    }
+  };
+
+  const SortArrow = ({ col }) => {
+    if (sortKey !== col) return <span style={{ opacity: 0.25, marginLeft: 4 }}>↕</span>;
+    return <span style={{ marginLeft: 4, color: '#A8334D' }}>{sortDir === 'asc' ? '↑' : '↓'}</span>;
+  };
+
+  // Roof impact
+  const roofPmt = roofSchedule.annualPayment;
+  const roofPerHome = (homeValue / (TOTAL_AV * RES_SHARE)) * roofPmt * RES_SHARE;
+  const roofLifetimeTotal = roofPmt * roofTerm;
+  const roofLifetimePerHome = (homeValue / (TOTAL_AV * RES_SHARE)) * roofLifetimeTotal * RES_SHARE;
+  
+  // Library impact
+  const libraryPmt = librarySchedule.annualPayment;
+  const libraryPerHome = (homeValue / (TOTAL_AV * RES_SHARE)) * libraryPmt * RES_SHARE;
+
+  // FY27 baseline
+  const fy27 = yearlyData.find(y => y.year === 2027);
+  const fy28 = yearlyData.find(y => y.year === 2028);
+  const peakYear = yearlyData.reduce((max, y) => y.total > max.total ? y : max, yearlyData[0]);
+
+  return (
+    <div style={{ fontFamily: "'EB Garamond', 'Iowan Old Style', Georgia, serif", background: '#F4F1EA', minHeight: '100vh', color: '#1A1A1A' }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap');
+        .num { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
+        .rule { border: none; border-top: 1px solid #1A1A1A; margin: 0; }
+        .rule-thin { border: none; border-top: 1px solid #C8C0B0; margin: 0; }
+        .display { font-family: 'EB Garamond', serif; font-weight: 600; letter-spacing: -0.02em; line-height: 1.05; }
+        .label { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.15em; text-transform: uppercase; color: #6B6354; }
+        .kicker { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: #A8334D; }
+        button.tab { background: transparent; border: 1px solid #1A1A1A; padding: 8px 16px; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; cursor: pointer; transition: all 0.15s; }
+        button.tab:hover { background: #1A1A1A; color: #F4F1EA; }
+        button.tab.active { background: #1A1A1A; color: #F4F1EA; }
+        .input-row { display: flex; align-items: baseline; gap: 12px; padding: 8px 0; border-bottom: 1px dotted #C8C0B0; }
+        .input-row label { flex: 1; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: #4A4438; }
+        .input-row input, .input-row select { font-family: 'JetBrains Mono', monospace; font-size: 13px; padding: 4px 8px; border: 1px solid #1A1A1A; background: #FAF8F2; width: 140px; }
+        .input-row input[type="checkbox"] { width: auto; }
+        th[onclick], th.sortable { transition: background 0.1s; }
+        thead tr th:hover { background: #EDE7DC; }
+      `}</style>
+
+      <div style={{ maxWidth: 1280, margin: '0 auto', padding: '48px 32px' }}>
+        {/* MASTHEAD */}
+        <header style={{ marginBottom: 48 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 }}>
+            <span className="kicker">Town of Hudson · Massachusetts</span>
+            <span className="label num">Fiscal Analysis · {new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}</span>
+          </div>
+          <hr className="rule" />
+          <h1 className="display" style={{ fontSize: 64, margin: '24px 0 8px', fontWeight: 700 }}>
+            Exempt Debt Burden
+          </h1>
+          <p style={{ fontSize: 20, fontStyle: 'italic', color: '#4A4438', maxWidth: 720, margin: 0, lineHeight: 1.4 }}>
+            Payoff projections for nine outstanding general-fund exempt debt obligations,
+            with scenario modeling for the proposed school roof replacement and library project.
+          </p>
+          <div style={{ marginTop: 24, fontSize: 13, color: '#6B6354', fontStyle: 'italic' }}>
+            Source: Treasurer's debt schedule (balances at 6/30/2026); FY26 Tax Classification Hearing, Board of Assessors (Dec 1, 2025); School roof debt exclusion presentation (Dec 2025).
+          </div>
+        </header>
+
+        {/* HEADLINE STATS */}
+        <section style={{ marginBottom: 48, display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 0, border: '1px solid #1A1A1A' }}>
+          {[
+            { label: 'Total Principal Outstanding', value: '$52.4M', sub: 'across 9 obligations' },
+            { label: 'FY27 Annual Burden', value: formatDollar(fy27?.perHome || 0), sub: `on $${homeValue.toLocaleString()} home` },
+            { label: 'Debt as % of Tax Bill', value: `${((fy27?.debtRatio || 0) * 100).toFixed(1)}%`, sub: `of ~$${Math.round((fy27?.totalTaxBill || 0)).toLocaleString()} total bill` },
+            { label: 'Peak Year Burden', value: formatDollar(peakYear?.perHome || 0), sub: `FY${peakYear?.year}` },
+          ].map((stat, i) => (
+            <div key={i} style={{ padding: 24, borderRight: i < 3 ? '1px solid #1A1A1A' : 'none', background: i % 2 === 0 ? '#F4F1EA' : '#EDE7DC' }}>
+              <div className="label" style={{ marginBottom: 8 }}>{stat.label}</div>
+              <div className="display num" style={{ fontSize: 36 }}>{stat.value}</div>
+              <div style={{ fontSize: 12, fontStyle: 'italic', color: '#6B6354', marginTop: 4 }}>{stat.sub}</div>
+            </div>
+          ))}
+        </section>
+
+        {/* CONTROLS */}
+        <section style={{ marginBottom: 48, display: 'grid', gridTemplateColumns: '2fr 3fr', gap: 32 }}>
+          <div style={{ background: '#FAF8F2', padding: 24, border: '1px solid #1A1A1A' }}>
+            <div className="kicker" style={{ marginBottom: 12 }}>Scenario Inputs</div>
+            <div className="input-row">
+              <label>Home Value (FY26)</label>
+              <input type="number" value={homeValue} onChange={e => setHomeValue(Number(e.target.value))} step={10000} />
+            </div>
+            <div className="input-row">
+              <label>Property Value Growth (%)</label>
+              <input type="number" value={valueGrowth} onChange={e => setValueGrowth(Number(e.target.value))} step={0.25} min={0} max={20} />
+            </div>
+            <div className="input-row">
+              <label>Operating Levy Growth (%)</label>
+              <input type="number" value={levyGrowth} onChange={e => setLevyGrowth(Number(e.target.value))} step={0.25} min={0} max={10} />
+            </div>
+
+            <div style={{ marginTop: 16, paddingTop: 8, borderTop: '1px solid #C8C0B0' }}>
+              <div className="kicker" style={{ marginBottom: 8, color: '#D4A574' }}>School Roofs</div>
+              <div className="input-row">
+                <label>Include Roof Project</label>
+                <input type="checkbox" checked={includeRoof} onChange={e => setIncludeRoof(e.target.checked)} />
+              </div>
+              <div className="input-row">
+                <label>Roof Cost</label>
+                <input type="number" value={roofCost} onChange={e => setRoofCost(Number(e.target.value))} step={100000} disabled={!includeRoof} />
+              </div>
+              <div className="input-row">
+                <label>Term (years)</label>
+                <select value={roofTerm} onChange={e => setRoofTerm(Number(e.target.value))} disabled={!includeRoof}>
+                  <option value={15}>15</option>
+                  <option value={20}>20</option>
+                  <option value={25}>25</option>
+                  <option value={30}>30</option>
+                </select>
+              </div>
+              <div className="input-row" style={{ borderBottom: 'none' }}>
+                <label>Interest Rate (%)</label>
+                <input type="number" value={roofRate} onChange={e => setRoofRate(Number(e.target.value))} step={0.25} min={0} max={15} disabled={!includeRoof} />
+              </div>
+            </div>
+
+            <div style={{ marginTop: 16, paddingTop: 8, borderTop: '1px solid #C8C0B0' }}>
+              <div className="kicker" style={{ marginBottom: 8, color: '#4A6B8A' }}>Library Project</div>
+              <div className="input-row">
+                <label>Include Library</label>
+                <input type="checkbox" checked={includeLibrary} onChange={e => setIncludeLibrary(e.target.checked)} />
+              </div>
+              <div className="input-row">
+                <label>Total Project Cost</label>
+                <select value={libraryTotal} onChange={e => setLibraryTotal(Number(e.target.value))} disabled={!includeLibrary}>
+                  <option value={20_000_000}>$20M (low estimate)</option>
+                  <option value={22_000_000}>$22M (midpoint)</option>
+                  <option value={24_000_000}>$24M (high estimate)</option>
+                </select>
+              </div>
+              <div className="input-row">
+                <label>Debt Start Year</label>
+                <select value={libraryStartYear} onChange={e => setLibraryStartYear(Number(e.target.value))} disabled={!includeLibrary}>
+                  <option value={2028}>FY28</option>
+                  <option value={2029}>FY29</option>
+                  <option value={2030}>FY30</option>
+                  <option value={2031}>FY31</option>
+                </select>
+              </div>
+              <div className="input-row">
+                <label>Term (years)</label>
+                <select value={libraryTerm} onChange={e => setLibraryTerm(Number(e.target.value))} disabled={!includeLibrary}>
+                  <option value={20}>20</option>
+                  <option value={25}>25</option>
+                  <option value={30}>30</option>
+                </select>
+              </div>
+              <div className="input-row" style={{ borderBottom: 'none' }}>
+                <label>Interest Rate (%)</label>
+                <input type="number" value={libraryRate} onChange={e => setLibraryRate(Number(e.target.value))} step={0.25} min={0} max={15} disabled={!includeLibrary} />
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* Roof impact card */}
+            <div style={{ background: '#1A1A1A', color: '#F4F1EA', padding: 24, opacity: includeRoof ? 1 : 0.4 }}>
+              <div className="kicker" style={{ color: '#D4A574', marginBottom: 8 }}>School Roof Impact</div>
+              <h2 className="display" style={{ fontSize: 28, margin: '0 0 16px', fontWeight: 600 }}>
+                {includeRoof ? `+${formatDollar(roofPerHome)}/year` : 'Disabled'}
+              </h2>
+              {includeRoof && (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, fontSize: 13 }}>
+                  <div>
+                    <div style={{ fontSize: 9, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#A8A294', marginBottom: 4 }}>Annual Levy</div>
+                    <div className="num" style={{ fontSize: 16 }}>{formatDollar(roofPmt)}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 9, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#A8A294', marginBottom: 4 }}>Lifetime/Home</div>
+                    <div className="num" style={{ fontSize: 16 }}>{formatDollar(roofLifetimePerHome)}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 9, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#A8A294', marginBottom: 4 }}>Term</div>
+                    <div className="num" style={{ fontSize: 16 }}>{roofTerm}yr</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 9, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#A8A294', marginBottom: 4 }}>Last FY</div>
+                    <div className="num" style={{ fontSize: 16 }}>FY{2027 + roofTerm}</div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Library impact card */}
+            <div style={{ background: '#2A3A4A', color: '#F4F1EA', padding: 24, opacity: includeLibrary ? 1 : 0.4 }}>
+              <div className="kicker" style={{ color: '#7DA0C4', marginBottom: 8 }}>Library Project Impact</div>
+              <h2 className="display" style={{ fontSize: 28, margin: '0 0 16px', fontWeight: 600 }}>
+                {includeLibrary ? `+${formatDollar(libraryPerHome)}/year` : 'Disabled'}
+              </h2>
+              {includeLibrary && (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, fontSize: 13, marginBottom: 12 }}>
+                    <div>
+                      <div style={{ fontSize: 9, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#A0B5C8', marginBottom: 4 }}>Total Project</div>
+                      <div className="num" style={{ fontSize: 16 }}>{formatDollar(libraryTotal)}</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 9, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#A0B5C8', marginBottom: 4 }}>MBLC Grant</div>
+                      <div className="num" style={{ fontSize: 16 }}>−{formatDollar(libraryGrant)}</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 9, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#A0B5C8', marginBottom: 4 }}>Local Bonded</div>
+                      <div className="num" style={{ fontSize: 16 }}>{formatDollar(libraryLocal)}</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 9, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#A0B5C8', marginBottom: 4 }}>Term</div>
+                      <div className="num" style={{ fontSize: 16 }}>FY{libraryStartYear}–{libraryStartYear + libraryTerm - 1}</div>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 11, fontStyle: 'italic', color: '#A0B5C8', borderTop: '1px solid #4A5A6A', paddingTop: 8 }}>
+                    Lifetime cost per home: {formatDollar(libraryPerHome * libraryTerm)} · Annual town levy: {formatDollar(libraryPmt)}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </section>
+
+        {/* VIEW SELECTOR */}
+        <section style={{ marginBottom: 24 }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button className={`tab ${view === 'stacked' ? 'active' : ''}`} onClick={() => setView('stacked')}>Stacked Payoff</button>
+            <button className={`tab ${view === 'byProject' ? 'active' : ''}`} onClick={() => setView('byProject')}>By Project</button>
+            <button className={`tab ${view === 'perHome' ? 'active' : ''}`} onClick={() => setView('perHome')}>Per Home Burden</button>
+            <button className={`tab ${view === 'totalBill' ? 'active' : ''}`} onClick={() => setView('totalBill')}>Total Tax Bill</button>
+            <button className={`tab ${view === 'ratio' ? 'active' : ''}`} onClick={() => setView('ratio')}>Debt Ratio</button>
+          </div>
+        </section>
+
+        {/* MAIN CHART */}
+        <section style={{ background: '#FAF8F2', border: '1px solid #1A1A1A', padding: 32, marginBottom: 32 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 }}>
+            <h3 className="display" style={{ fontSize: 24, margin: 0 }}>
+              {view === 'stacked' && 'Annual Debt Service · FY2027 — FY2055'}
+              {view === 'byProject' && 'Lifetime Cost by Project'}
+              {view === 'perHome' && 'Annual Burden · Average Single-Family Home'}
+              {view === 'totalBill' && 'Total Tax Bill · Debt vs. Operating'}
+              {view === 'ratio' && 'Debt as % of Total Tax Bill'}
+            </h3>
+            <div className="label">
+              {view === 'stacked' && 'Stacked by debt obligation'}
+              {view === 'byProject' && 'Total principal + interest'}
+              {view === 'perHome' && `Based on $${homeValue.toLocaleString()} home`}
+              {view === 'totalBill' && `Value growth ${valueGrowth.toFixed(1)}% · Levy growth ${levyGrowth.toFixed(1)}%`}
+              {view === 'ratio' && 'Debt-exclusion share of bill'}
+            </div>
+          </div>
+          <hr className="rule-thin" style={{ marginBottom: 16 }} />
+
+          <div style={{ width: '100%', height: 480 }}>
+            {view === 'stacked' && (
+              <ResponsiveContainer>
+                <AreaChart data={yearlyData}>
+                  <CartesianGrid strokeDasharray="2 4" stroke="#C8C0B0" />
+                  <XAxis dataKey="year" stroke="#1A1A1A" tick={{ fontFamily: 'JetBrains Mono', fontSize: 11 }} />
+                  <YAxis stroke="#1A1A1A" tick={{ fontFamily: 'JetBrains Mono', fontSize: 11 }} tickFormatter={formatCurrency} />
+                  <Tooltip
+                    contentStyle={{ background: '#FAF8F2', border: '1px solid #1A1A1A', fontFamily: 'JetBrains Mono', fontSize: 11 }}
+                    formatter={(val, name) => {
+                      const debt = allSchedules.find(d => d.id === name);
+                      return [formatDollar(val), debt ? `${debt.name} (${debt.issued})` : name];
+                    }}
+                  />
+                  {allSchedules.map(d => (
+                    <Area key={d.id} type="step" dataKey={d.id} stackId="1" stroke={d.color} fill={d.color} fillOpacity={0.85} />
+                  ))}
+                </AreaChart>
+              </ResponsiveContainer>
+            )}
+            {view === 'byProject' && (
+              <ResponsiveContainer>
+                <BarChart data={debtTotals.sort((a, b) => b.totalPaid - a.totalPaid)} layout="vertical" margin={{ left: 180 }}>
+                  <CartesianGrid strokeDasharray="2 4" stroke="#C8C0B0" />
+                  <XAxis type="number" stroke="#1A1A1A" tick={{ fontFamily: 'JetBrains Mono', fontSize: 11 }} tickFormatter={formatCurrency} />
+                  <YAxis type="category" dataKey="name" stroke="#1A1A1A" tick={{ fontFamily: 'EB Garamond', fontSize: 12 }} width={170} />
+                  <Tooltip
+                    contentStyle={{ background: '#FAF8F2', border: '1px solid #1A1A1A', fontFamily: 'JetBrains Mono', fontSize: 11 }}
+                    formatter={(val) => formatDollar(val)}
+                  />
+                  <Bar dataKey="totalPaid" name="Lifetime P+I">
+                    {debtTotals.map((d, i) => (
+                      <rect key={i} fill={d.color} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            )}
+            {view === 'perHome' && (
+              <ResponsiveContainer>
+                <AreaChart data={yearlyData}>
+                  <CartesianGrid strokeDasharray="2 4" stroke="#C8C0B0" />
+                  <XAxis dataKey="year" stroke="#1A1A1A" tick={{ fontFamily: 'JetBrains Mono', fontSize: 11 }} />
+                  <YAxis stroke="#1A1A1A" tick={{ fontFamily: 'JetBrains Mono', fontSize: 11 }} tickFormatter={(v) => `$${v.toFixed(0)}`} />
+                  <Tooltip
+                    contentStyle={{ background: '#FAF8F2', border: '1px solid #1A1A1A', fontFamily: 'JetBrains Mono', fontSize: 11 }}
+                    formatter={(val) => formatDollar(val)}
+                  />
+                  <Area type="step" dataKey="perHome" stroke="#A8334D" fill="#A8334D" fillOpacity={0.4} name="Annual burden per home" />
+                </AreaChart>
+              </ResponsiveContainer>
+            )}
+            {view === 'totalBill' && (
+              <ResponsiveContainer>
+                <AreaChart data={yearlyData}>
+                  <CartesianGrid strokeDasharray="2 4" stroke="#C8C0B0" />
+                  <XAxis dataKey="year" stroke="#1A1A1A" tick={{ fontFamily: 'JetBrains Mono', fontSize: 11 }} />
+                  <YAxis stroke="#1A1A1A" tick={{ fontFamily: 'JetBrains Mono', fontSize: 11 }} tickFormatter={(v) => `$${(v/1000).toFixed(1)}K`} />
+                  <Tooltip
+                    contentStyle={{ background: '#FAF8F2', border: '1px solid #1A1A1A', fontFamily: 'JetBrains Mono', fontSize: 11 }}
+                    formatter={(val, name) => [formatDollar(val), name]}
+                    labelFormatter={(yr) => {
+                      const row = yearlyData.find(r => r.year === yr);
+                      return `FY${yr} · Home value: ${formatDollar(row?.projectedHomeValue || 0)}`;
+                    }}
+                  />
+                  <Legend wrapperStyle={{ fontFamily: 'JetBrains Mono', fontSize: 11 }} />
+                  <Area type="monotone" dataKey="nonDebtTaxBill" stackId="1" stroke="#3F5E39" fill="#3F5E39" fillOpacity={0.7} name="Operating budget portion" />
+                  <Area type="monotone" dataKey="perHome" stackId="1" stroke="#A8334D" fill="#A8334D" fillOpacity={0.85} name="Exempt debt portion" />
+                </AreaChart>
+              </ResponsiveContainer>
+            )}
+            {view === 'ratio' && (
+              <ResponsiveContainer>
+                <LineChart data={yearlyData}>
+                  <CartesianGrid strokeDasharray="2 4" stroke="#C8C0B0" />
+                  <XAxis dataKey="year" stroke="#1A1A1A" tick={{ fontFamily: 'JetBrains Mono', fontSize: 11 }} />
+                  <YAxis stroke="#1A1A1A" tick={{ fontFamily: 'JetBrains Mono', fontSize: 11 }} tickFormatter={(v) => `${(v*100).toFixed(1)}%`} domain={[0, 'auto']} />
+                  <Tooltip
+                    contentStyle={{ background: '#FAF8F2', border: '1px solid #1A1A1A', fontFamily: 'JetBrains Mono', fontSize: 11 }}
+                    formatter={(val) => `${(val*100).toFixed(2)}%`}
+                  />
+                  <Line type="monotone" dataKey="debtRatio" stroke="#A8334D" strokeWidth={3} dot={false} name="Debt share" />
+                </LineChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+        </section>
+
+        {/* DEBT TABLE */}
+        <section style={{ marginBottom: 48 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 }}>
+            <h3 className="display" style={{ fontSize: 28, margin: 0 }}>Obligations · Detailed Breakdown</h3>
+            <span className="label" style={{ fontStyle: 'italic', textTransform: 'none', letterSpacing: 0 }}>Click any column header to sort</span>
+          </div>
+          <hr className="rule" />
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid #1A1A1A' }}>
+                <th style={{ textAlign: 'left', padding: '12px 8px', fontFamily: 'JetBrains Mono', fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#6B6354' }}></th>
+                <th onClick={() => handleSort('name')} style={{ textAlign: 'left', padding: '12px 8px', fontFamily: 'JetBrains Mono', fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#6B6354', cursor: 'pointer', userSelect: 'none' }}>Project<SortArrow col="name" /></th>
+                <th onClick={() => handleSort('balance')} style={{ textAlign: 'right', padding: '12px 8px', fontFamily: 'JetBrains Mono', fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#6B6354', cursor: 'pointer', userSelect: 'none' }}>Balance<SortArrow col="balance" /></th>
+                <th onClick={() => handleSort('rate')} style={{ textAlign: 'right', padding: '12px 8px', fontFamily: 'JetBrains Mono', fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#6B6354', cursor: 'pointer', userSelect: 'none' }}>Rate<SortArrow col="rate" /></th>
+                <th onClick={() => handleSort('lastYear')} style={{ textAlign: 'right', padding: '12px 8px', fontFamily: 'JetBrains Mono', fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#6B6354', cursor: 'pointer', userSelect: 'none' }}>Last FY<SortArrow col="lastYear" /></th>
+                <th onClick={() => handleSort('annualPayment')} style={{ textAlign: 'right', padding: '12px 8px', fontFamily: 'JetBrains Mono', fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#6B6354', cursor: 'pointer', userSelect: 'none' }}>Annual P+I<SortArrow col="annualPayment" /></th>
+                <th onClick={() => handleSort('totalPaid')} style={{ textAlign: 'right', padding: '12px 8px', fontFamily: 'JetBrains Mono', fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#6B6354', cursor: 'pointer', userSelect: 'none' }}>Lifetime P+I<SortArrow col="totalPaid" /></th>
+                <th onClick={() => handleSort('perHomeAnnual')} style={{ textAlign: 'right', padding: '12px 8px', fontFamily: 'JetBrains Mono', fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#6B6354', cursor: 'pointer', userSelect: 'none' }}>Per Home/yr<SortArrow col="perHomeAnnual" /></th>
+              </tr>
+            </thead>
+            <tbody>
+              {sortedDebts.map((d, i) => {
+                const isProposed = d.id === 'roof' || d.id === 'library';
+                return (
+                  <tr key={d.id} style={{ borderBottom: '1px dotted #C8C0B0', background: isProposed ? '#FAEFD9' : 'transparent' }}>
+                    <td style={{ padding: '10px 8px' }}>
+                      <span style={{ display: 'inline-block', width: 12, height: 12, background: d.color }}></span>
+                    </td>
+                    <td style={{ padding: '10px 8px' }}>
+                      <div style={{ fontFamily: 'EB Garamond', fontSize: 14, fontWeight: 500, fontStyle: isProposed ? 'italic' : 'normal' }}>
+                        {d.name}
+                      </div>
+                      <div style={{ fontFamily: 'JetBrains Mono', fontSize: 10, color: '#6B6354' }}>{d.issued}</div>
+                    </td>
+                    <td className="num" style={{ padding: '10px 8px', textAlign: 'right' }}>{formatDollar(d.balance)}</td>
+                    <td className="num" style={{ padding: '10px 8px', textAlign: 'right' }}>{(d.rate * 100).toFixed(2)}%</td>
+                    <td className="num" style={{ padding: '10px 8px', textAlign: 'right' }}>{d.lastYear}</td>
+                    <td className="num" style={{ padding: '10px 8px', textAlign: 'right' }}>{formatDollar(d.annualPayment)}</td>
+                    <td className="num" style={{ padding: '10px 8px', textAlign: 'right' }}>{formatDollar(d.totalPaid)}</td>
+                    <td className="num" style={{ padding: '10px 8px', textAlign: 'right', fontWeight: 600 }}>{formatDollar(d.perHomeAnnual)}</td>
+                  </tr>
+                );
+              })}
+              <tr style={{ borderTop: '1px solid #1A1A1A', borderBottom: '1px solid #1A1A1A', fontWeight: 600 }}>
+                <td></td>
+                <td style={{ padding: '12px 8px', fontFamily: 'EB Garamond', fontSize: 15 }}>Totals</td>
+                <td className="num" style={{ padding: '12px 8px', textAlign: 'right' }}>
+                  {formatDollar(debtTotals.reduce((s, d) => s + d.balance, 0))}
+                </td>
+                <td colSpan={2}></td>
+                <td className="num" style={{ padding: '12px 8px', textAlign: 'right' }}>
+                  {formatDollar(fy27?.total || 0)}
+                </td>
+                <td className="num" style={{ padding: '12px 8px', textAlign: 'right' }}>
+                  {formatDollar(debtTotals.reduce((s, d) => s + d.totalPaid, 0))}
+                </td>
+                <td className="num" style={{ padding: '12px 8px', textAlign: 'right' }}>
+                  {formatDollar(fy27?.perHome || 0)}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        {/* NOTES */}
+        <section style={{ background: '#EDE7DC', padding: 32, border: '1px solid #1A1A1A', marginBottom: 48 }}>
+          <div className="kicker" style={{ marginBottom: 12 }}>Modeling Notes</div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, fontSize: 14, lineHeight: 1.6 }}>
+            <div>
+              <p style={{ marginTop: 0 }}><strong>Methodology.</strong> Each debt is amortized as level debt service from FY2027 through its scheduled last payment year. Per-home figures apply the 88% residential share of FY26 total assessed value. The school roof rate (5.82%) is calibrated to reproduce the Town's officially stated $97.59/yr-per-home figure.</p>
+              <p><strong>Growth assumptions.</strong> Property value growth is applied to both the individual home and town-wide AV — these largely cancel for the per-home debt share (debt is fixed nominal dollars). Operating levy grows at the selected rate (Prop 2½ baseline of 2.5%, with new growth typically adding 0.5–1% on top). Hudson's actual FY13–FY26 average home CAGR was 5.97%; FY25–FY26 was 3.99%.</p>
+            </div>
+            <div>
+              <p style={{ marginTop: 0 }}><strong>The DPW conversion.</strong> The $34M temp note is currently interest-only (~$1.2M/yr). Permanent bonding will add roughly $1M/year to the levy — about $155 more on the average single-family bill — already authorized.</p>
+              <p><strong>Roof project.</strong> $7.255M for High School + Farley roofs (warranties expired 2023 and 2020). 15-year term produces $97.59/yr per average home, FY28 — FY42.</p>
+              <p><strong>Library project.</strong> Total cost estimated at $20–24M per the Library Building Project page. MBLC grant tiers apply (60%/45%/35%/30% on tranches), yielding ~42% reimbursement at $22M midpoint. Only the local share is bonded. Director Sanchez-Himes has indicated a future Prop 2½ debt exclusion vote, with potential 2026 Town Meeting consideration. Design phase runs Oct 2024 – Dec 2025, suggesting bond issuance not before FY28-FY29.</p>
+              <p><strong>Limitations.</strong> Actual bond structures may use front-loaded principal. Library "approximately 50/50" goal stated by Director may incorporate non-MBLC-eligible costs allocated entirely to local share. Confirm with the Treasurer before public citation.</p>
+            </div>
+          </div>
+        </section>
+
+        <footer style={{ paddingTop: 32, borderTop: '1px solid #1A1A1A', display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', fontSize: 11, color: '#6B6354', fontFamily: 'JetBrains Mono' }}>
+          <span>Prepared for civic policy review</span>
+          <span>Hudson, MA · Conservation Commission · Green Hudson</span>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(HudsonDebtDashboard));
+</script>
+</body>
+</html>
